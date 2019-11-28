@@ -1,0 +1,192 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index ad79b65..26ac113 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -70,6 +70,9 @@ void            net_tx_udp(struct mbuf*, uint32, uint16, uint16);
+ // sysnet.c
+ void            sockinit(void);
+ int             sockalloc(struct file **, uint32, uint16, uint16);
++void            sockclose(struct sock*, int);
++int             sockread(struct sock*, uint64, int);
++int             sockwrite(struct sock*, uint64, int);
+ void            sockrecvudp(struct mbuf*, uint32, uint16, uint16);
+ 
+ // ramdisk.c
+diff --git a/kernel/file.c b/kernel/file.c
+index 671e44c..b8dd007 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -75,6 +75,8 @@ fileclose(struct file *f)
+ 
+   if(ff.type == FD_PIPE){
+     pipeclose(ff.pipe, ff.writable);
++  } else if(ff.type == FD_SOCK){
++    sockclose(ff.sock, ff.writeable);
+   } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
+     begin_op(ff.ip->dev);
+     iput(ff.ip);
+@@ -89,7 +91,7 @@ filestat(struct file *f, uint64 addr)
+ {
+   struct proc *p = myproc();
+   struct stat st;
+-  
++
+   if(f->type == FD_INODE || f->type == FD_DEVICE){
+     ilock(f->ip);
+     stati(f->ip, &st);
+@@ -113,6 +115,8 @@ fileread(struct file *f, uint64 addr, int n)
+ 
+   if(f->type == FD_PIPE){
+     r = piperead(f->pipe, addr, n);
++  } else if(f->type == FD_SOCK){
++    r = sockread(f->sock, addr, n);
+   } else if(f->type == FD_DEVICE){
+     if(f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
+       return -1;
+@@ -141,6 +145,8 @@ filewrite(struct file *f, uint64 addr, int n)
+ 
+   if(f->type == FD_PIPE){
+     ret = pipewrite(f->pipe, addr, n);
++  } else if(f->type == FD_SOCK){
++    ret = sockwrite(f->sock, addr, n);
+   } else if(f->type == FD_DEVICE){
+     if(f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
+       return -1;
+@@ -179,4 +185,3 @@ filewrite(struct file *f, uint64 addr, int n)
+ 
+   return ret;
+ }
+-
+diff --git a/kernel/pipe.c b/kernel/pipe.c
+index 520957a..d001a3d 100644
+--- a/kernel/pipe.c
++++ b/kernel/pipe.c
+@@ -115,13 +115,10 @@ piperead(struct pipe *pi, uint64 addr, int n)
+     sleep(&pi->nread, &pi->lock); //DOC: piperead-sleep
+   }
+   for(i = 0; i < n; i++){  //DOC: piperead-copy
+-    if(pi->nread == pi->nwrite)
+-      break;
+-    ch = pi->data[pi->nread++ % PIPESIZE];
++    ch = mbufpull(m, 1);
+     if(copyout(pr->pagetable, addr + i, &ch, 1) == -1)
+       break;
+   }
+-  wakeup(&pi->nwrite);  //DOC: piperead-wakeup
+-  release(&pi->lock);
++  release(&si->lock);
+   return i;
+ }
+diff --git a/kernel/sysnet.c b/kernel/sysnet.c
+index 5eaeb68..90836ff 100644
+--- a/kernel/sysnet.c
++++ b/kernel/sysnet.c
+@@ -87,6 +87,83 @@ bad:
+ // and writing for network sockets.
+ //
+ 
++void
++sockclose(struct sock *si, int writable) {
++  struct sock *pos, *next;
++  acquire(&si->lock);
++
++  // free outstanding mbufs
++  while(!mbufq_empty(&si->rxq)) {
++    mbuffree(mbufq_pophead(&si->rxq));
++  }
++
++  // remove from sockets
++  acquire(&lock);
++  pos = sockets;
++  if (pos->raddr == si->raddr &&
++      pos->lport == si->lport &&
++  pos->rport == si->rport) {
++    sockets = pos->next;
++  } else {
++    while(pos->next) {
++      next = pos->next;
++      if (next->raddr == si->raddr &&
++          next->lport == si->lport &&
++      next->rport == si->rport) {
++        pos->next = next->next;
++        break;
++    }
++  }
++  release(&lock);
++
++  // clean up
++  release(&si->lock);
++  kfree((char*)si);
++}
++
++int
++sockwrite(struct sock *si, uint64 addr, int n) {
++  struct mbuf *m;
++  struct proc *pr = myproc();
++
++  m = mbufalloc(MBUF_DEFAULT_HEADROOM);
++
++  acquire(&si->lock);
++  if (copyin(pr->pagetable, mbufput(m, n), addr, n) == -1) {
++    return -1;
++  }
++  net_tx_udp(m, si->raddr ,si->lport, si->rport);
++  release(&si->lock);
++
++  return n;
++}
++
++int
++sockread(struct sock *si, uint64 addr, int n) {
++  struct mbuf *m;
++  struct proc *pr = myproc();
++  int i;
++  char ch;
++
++  acquire(&si->lock);
++  while(mbufq_empty(&si->rxq) {
++    if(myproc()->killed){
++      release(&si->lock);
++      return -1;
++    }
++    sleep(&si->rxq, &si->lock);
++  }
++  m = mbufq_pophead(&si->rxq);
++  for(i = 0; i < n; i++){
++    ch = m->head;
++    if(copyout(pr->pagetable, addr + i, &ch, 1) == -1)
++      break;
++  }
++
++  release(&si->lock);
++  return i;
++}
++
+ // called by protocol handler layer to deliver UDP packets
+ void
+ sockrecvudp(struct mbuf *m, uint32 raddr, uint16 lport, uint16 rport)
+@@ -98,5 +175,23 @@ sockrecvudp(struct mbuf *m, uint32 raddr, uint16 lport, uint16 rport)
+   // any sleeping reader. Free the mbuf if there are no sockets
+   // registered to handle it.
+   //
+-  mbuffree(m);
++  struct sock *si;
++
++  acquire(&lock);
++  si = sockets;
++  while(si) {
++    if (si->raddr == raddr &&
++        si->lport == lport &&
++	si->rport == rport) {
++      release(&lock);
++      break;
++    }
++    si = si->next;
++  }
++  if (si) {
++    mbufq_pushtail(&si->rxq, m);
++    wakeup(&si->rxq);
++  } else {
++    mbuffree(m);
++  }
+ }
